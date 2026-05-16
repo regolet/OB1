@@ -1,10 +1,17 @@
-﻿{
+{
   "name": "@regolet/superbrain",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "SuperBrain — A fully local, SQLite-powered MCP server for persistent AI memory. Fork of Open Brain (OB1) — no cloud, no SaaS, just your brain on your machine.",
   "main": "src/index.js",
   "bin": {
     "superbrain": "src/index.js"
+  },
+  "files": [
+    "README.md",
+    "src"
+  ],
+  "scripts": {
+    "test": "node --test"
   },
   "keywords": [
     "mcp",
@@ -18,7 +25,7 @@
   "license": "FSL-1.1-MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/regolet/OB1"
+    "url": "git+https://github.com/regolet/OB1.git"
   },
   "engines": {
     "node": ">=18.0.0"

@@ -17,6 +17,7 @@ const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const { initDatabase, closeDatabase, DB_PATH } = require('./database');
 const { registerTools } = require('./tools');
+const packageInfo = require('../package.json');
 
 // Handle --info flag
 if (process.argv.includes('--info')) {
@@ -44,7 +45,7 @@ async function main() {
 
   const server = new McpServer({
     name: 'superbrain',
-    version: '1.0.0',
+    version: packageInfo.version,
   });
 
   registerTools(server);
