@@ -1,8 +1,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const Database = require('better-sqlite3');
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'superbrain-test-'));
 process.env.SUPERBRAIN_DIR = tempDir;
@@ -114,4 +116,39 @@ test('exports and imports thoughts safely', () => {
 
   const results = brain.searchThoughts('imported provenance', { project: 'SuperBrain', limit: 5 });
   assert.ok(results.some((thought) => thought.source === 'imported'));
+});
+
+test('migrates a pre-1.1 database before creating new indexes', () => {
+  const legacyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'superbrain-legacy-'));
+  const legacyPath = path.join(legacyDir, 'brain.db');
+  const legacyDb = new Database(legacyPath);
+  legacyDb.exec(`
+    CREATE TABLE thoughts (
+      id TEXT PRIMARY KEY,
+      content TEXT NOT NULL,
+      metadata TEXT DEFAULT '{}',
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+    INSERT INTO thoughts (id, content, metadata)
+    VALUES ('legacy-one', 'Legacy memory before project column', '{"type":"observation"}');
+  `);
+  legacyDb.close();
+
+  const script = `
+    const brain = require(${JSON.stringify(path.resolve(__dirname, '../src/database'))});
+    brain.initDatabase();
+    const row = brain.fetchThought('legacy-one');
+    if (!row || row.type !== 'observation') process.exit(2);
+    brain.closeDatabase();
+  `;
+
+  const result = spawnSync(process.execPath, ['-e', script], {
+    cwd: path.resolve(__dirname, '..'),
+    env: { ...process.env, SUPERBRAIN_DIR: legacyDir },
+    encoding: 'utf8',
+  });
+
+  fs.rmSync(legacyDir, { recursive: true, force: true });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
 });

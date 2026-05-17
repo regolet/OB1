@@ -1,6 +1,6 @@
 {
   "name": "@regolet/superbrain",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "SuperBrain — A fully local, SQLite-powered MCP server for persistent AI memory. Fork of Open Brain (OB1) — no cloud, no SaaS, just your brain on your machine.",
   "main": "src/index.js",
   "bin": {

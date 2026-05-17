@@ -221,6 +221,31 @@ function ensureColumn(table, name, definition) {
   }
 }
 
+function dropFtsTriggers() {
+  db.exec(`
+    DROP TRIGGER IF EXISTS thoughts_ai;
+    DROP TRIGGER IF EXISTS thoughts_ad;
+    DROP TRIGGER IF EXISTS thoughts_au;
+  `);
+}
+
+function createFtsTriggers() {
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS thoughts_ai AFTER INSERT ON thoughts BEGIN
+      INSERT INTO thoughts_fts(rowid, content) VALUES (new.rowid, new.content);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS thoughts_ad AFTER DELETE ON thoughts BEGIN
+      INSERT INTO thoughts_fts(thoughts_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS thoughts_au AFTER UPDATE ON thoughts BEGIN
+      INSERT INTO thoughts_fts(thoughts_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+      INSERT INTO thoughts_fts(rowid, content) VALUES (new.rowid, new.content);
+    END;
+  `);
+}
+
 function syncDerivedColumns() {
   const rows = db.prepare(`
     SELECT id, content, metadata, type, source, project, confidence, verified_at, stale_after
@@ -275,11 +300,6 @@ function initDatabase() {
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     );
-    CREATE INDEX IF NOT EXISTS idx_thoughts_created_at ON thoughts(created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_thoughts_project ON thoughts(project);
-    CREATE INDEX IF NOT EXISTS idx_thoughts_type ON thoughts(type);
-    CREATE INDEX IF NOT EXISTS idx_thoughts_source ON thoughts(source);
-    CREATE INDEX IF NOT EXISTS idx_thoughts_stale_after ON thoughts(stale_after);
   `);
 
   ensureColumn('thoughts', 'type', 'TEXT');
@@ -289,6 +309,17 @@ function initDatabase() {
   ensureColumn('thoughts', 'verified_at', 'TEXT');
   ensureColumn('thoughts', 'stale_after', 'TEXT');
 
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_thoughts_created_at ON thoughts(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_thoughts_project ON thoughts(project);
+    CREATE INDEX IF NOT EXISTS idx_thoughts_type ON thoughts(type);
+    CREATE INDEX IF NOT EXISTS idx_thoughts_source ON thoughts(source);
+    CREATE INDEX IF NOT EXISTS idx_thoughts_stale_after ON thoughts(stale_after);
+  `);
+
+  dropFtsTriggers();
+
+  let ftsAvailable = false;
   try {
     db.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS thoughts_fts USING fts5(
@@ -298,40 +329,18 @@ function initDatabase() {
         tokenize='porter unicode61'
       );
     `);
+    ftsAvailable = true;
   } catch {
     // FTS5 may be unavailable in a custom SQLite build. LIKE fallback still works.
   }
 
-  const triggerExists = db.prepare(
-    "SELECT name FROM sqlite_master WHERE type='trigger' AND name=?"
-  );
-
-  if (!triggerExists.get('thoughts_ai')) {
-    db.exec(`
-      CREATE TRIGGER thoughts_ai AFTER INSERT ON thoughts BEGIN
-        INSERT INTO thoughts_fts(rowid, content) VALUES (new.rowid, new.content);
-      END;
-    `);
-  }
-
-  if (!triggerExists.get('thoughts_ad')) {
-    db.exec(`
-      CREATE TRIGGER thoughts_ad AFTER DELETE ON thoughts BEGIN
-        INSERT INTO thoughts_fts(thoughts_fts, rowid, content) VALUES('delete', old.rowid, old.content);
-      END;
-    `);
-  }
-
-  if (!triggerExists.get('thoughts_au')) {
-    db.exec(`
-      CREATE TRIGGER thoughts_au AFTER UPDATE ON thoughts BEGIN
-        INSERT INTO thoughts_fts(thoughts_fts, rowid, content) VALUES('delete', old.rowid, old.content);
-        INSERT INTO thoughts_fts(rowid, content) VALUES (new.rowid, new.content);
-      END;
-    `);
-  }
-
   syncDerivedColumns();
+
+  if (ftsAvailable) {
+    db.exec("INSERT INTO thoughts_fts(thoughts_fts) VALUES('rebuild')");
+    createFtsTriggers();
+  }
+
   return db;
 }
 
