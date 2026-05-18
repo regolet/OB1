@@ -93,6 +93,31 @@ function inferStaleDays(content, metadata) {
   return null;
 }
 
+function inferMemoryTier(metadata = {}) {
+  const explicit = cleanString(metadata.memory_tier || metadata.tier);
+  if (explicit) return explicit;
+
+  const type = String(metadata.type || '').toLowerCase();
+  if (['task', 'current_state', 'todo'].includes(type)) return 'working';
+  if (['incident', 'session_summary', 'milestone'].includes(type)) return 'episodic';
+  if (['procedure', 'workflow', 'runbook', 'playbook'].includes(type)) return 'procedural';
+  return 'semantic';
+}
+
+function inferImportance(metadata = {}) {
+  const explicit = clamp(metadata.importance, 0, 1);
+  if (explicit !== null) return explicit;
+
+  let score = 0.45;
+  const tier = inferMemoryTier(metadata);
+  if (tier === 'procedural') score += 0.2;
+  if (tier === 'working') score += 0.1;
+  if (Array.isArray(metadata.action_items) && metadata.action_items.length) score += 0.15;
+  if (Array.isArray(metadata.entities) && metadata.entities.length) score += 0.05;
+  if (Number.isFinite(Number(metadata.confidence))) score += Number(metadata.confidence) * 0.15;
+  return Math.max(0, Math.min(1, score));
+}
+
 function defaultConfidence(source) {
   const s = String(source || '').toLowerCase();
   if (s === 'user' || s === 'manual' || s === 'tool') return 0.9;
@@ -118,6 +143,9 @@ function normalizeMetadata(content, metadata = {}, existing = {}) {
       const staleDays = inferStaleDays(content, { ...existing, ...metadata, type, source, project });
       return staleDays ? addDays(new Date(), staleDays) : null;
     })();
+  const memoryTier = inferMemoryTier({ ...existing, ...metadata, type });
+  const importance = inferImportance({ ...existing, ...metadata, type, memory_tier: memoryTier, confidence });
+  const expiresAt = cleanString(metadata.expires_at) || cleanString(existing.expires_at) || null;
 
   return {
     ...existing,
@@ -132,6 +160,9 @@ function normalizeMetadata(content, metadata = {}, existing = {}) {
     confidence,
     verified_at: verifiedAt,
     stale_after: staleAfter,
+    memory_tier: memoryTier,
+    importance,
+    expires_at: expiresAt,
   };
 }
 
@@ -142,6 +173,7 @@ function mergeMetadata(base = {}, incoming = {}) {
   merged.action_items = uniqueStrings([...(base.action_items || []), ...(incoming.action_items || [])]);
   merged.entities = uniqueStrings([...(base.entities || []), ...(incoming.entities || [])]);
   merged.confidence = Math.max(Number(base.confidence || 0), Number(incoming.confidence || 0)) || defaultConfidence(merged.source);
+  merged.importance = Math.max(Number(base.importance || 0), Number(incoming.importance || 0)) || inferImportance(merged);
   return merged;
 }
 
@@ -166,6 +198,7 @@ function buildFtsQuery(query) {
 function metadataText(metadata) {
   return [
     metadata.type,
+    metadata.memory_tier,
     metadata.project,
     metadata.source,
     ...(metadata.topics || []),
@@ -184,15 +217,23 @@ function rowToThought(row) {
     confidence: row.confidence,
     verified_at: row.verified_at,
     stale_after: row.stale_after,
+    memory_tier: row.memory_tier,
+    importance: row.importance,
+    expires_at: row.expires_at,
   });
+  // Destructure to exclude embedding from output (it's huge and wastes tokens)
+  const { embedding: _embedding, ...rest } = row;
   return {
-    ...row,
+    ...rest,
     type: row.type || metadata.type,
     source: row.source || metadata.source,
     project: row.project || metadata.project,
     confidence: row.confidence ?? metadata.confidence,
     verified_at: row.verified_at || metadata.verified_at,
     stale_after: row.stale_after || metadata.stale_after,
+    memory_tier: row.memory_tier || metadata.memory_tier,
+    importance: row.importance ?? metadata.importance,
+    expires_at: row.expires_at || metadata.expires_at,
     metadata,
     stale_warning: getStaleWarning({ ...row, metadata }),
   };
@@ -248,14 +289,17 @@ function createFtsTriggers() {
 
 function syncDerivedColumns() {
   const rows = db.prepare(`
-    SELECT id, content, metadata, type, source, project, confidence, verified_at, stale_after
+    SELECT id, content, metadata, type, source, project, confidence, verified_at,
+           stale_after, memory_tier, importance, expires_at
     FROM thoughts
     WHERE type IS NULL OR source IS NULL OR confidence IS NULL
+       OR memory_tier IS NULL OR importance IS NULL
   `).all();
 
   const update = db.prepare(`
     UPDATE thoughts
-    SET metadata = ?, type = ?, source = ?, project = ?, confidence = ?, verified_at = ?, stale_after = ?
+    SET metadata = ?, type = ?, source = ?, project = ?, confidence = ?,
+        verified_at = ?, stale_after = ?, memory_tier = ?, importance = ?, expires_at = ?
     WHERE id = ?
   `);
 
@@ -270,6 +314,9 @@ function syncDerivedColumns() {
         metadata.confidence,
         metadata.verified_at,
         metadata.stale_after,
+        metadata.memory_tier,
+        metadata.importance,
+        metadata.expires_at,
         row.id
       );
     }
@@ -297,6 +344,9 @@ function initDatabase() {
       confidence REAL DEFAULT 0.8,
       verified_at TEXT,
       stale_after TEXT,
+      memory_tier TEXT,
+      importance REAL DEFAULT 0.5,
+      expires_at TEXT,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     );
@@ -308,6 +358,12 @@ function initDatabase() {
   ensureColumn('thoughts', 'confidence', 'REAL DEFAULT 0.8');
   ensureColumn('thoughts', 'verified_at', 'TEXT');
   ensureColumn('thoughts', 'stale_after', 'TEXT');
+  ensureColumn('thoughts', 'memory_tier', 'TEXT');
+  ensureColumn('thoughts', 'importance', 'REAL DEFAULT 0.5');
+  ensureColumn('thoughts', 'expires_at', 'TEXT');
+  ensureColumn('thoughts', 'embedding', 'TEXT');
+  ensureColumn('thoughts', 'access_count', 'INTEGER DEFAULT 0');
+  ensureColumn('thoughts', 'last_accessed', 'TEXT');
 
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_thoughts_created_at ON thoughts(created_at DESC);
@@ -315,7 +371,33 @@ function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_thoughts_type ON thoughts(type);
     CREATE INDEX IF NOT EXISTS idx_thoughts_source ON thoughts(source);
     CREATE INDEX IF NOT EXISTS idx_thoughts_stale_after ON thoughts(stale_after);
+    CREATE INDEX IF NOT EXISTS idx_thoughts_memory_tier ON thoughts(memory_tier);
+    CREATE INDEX IF NOT EXISTS idx_thoughts_importance ON thoughts(importance DESC);
   `);
+
+  db.function('vec_distance', { deterministic: true }, (a, b) => {
+    if (!a || !b) return 1;
+    try {
+      const vecA = JSON.parse(a);
+      const vecB = JSON.parse(b);
+      if (!Array.isArray(vecA) || !Array.isArray(vecB) || vecA.length !== vecB.length) return 1;
+      let dotProduct = 0;
+      let magA = 0;
+      let magB = 0;
+      for (let i = 0; i < vecA.length; i++) {
+        const valueA = Number(vecA[i]);
+        const valueB = Number(vecB[i]);
+        dotProduct += valueA * valueB;
+        magA += valueA * valueA;
+        magB += valueB * valueB;
+      }
+      if (!magA || !magB) return 1;
+      const cosine = dotProduct / (Math.sqrt(magA) * Math.sqrt(magB));
+      return 1 - Math.max(-1, Math.min(1, cosine));
+    } catch {
+      return 1;
+    }
+  });
 
   dropFtsTriggers();
 
@@ -362,6 +444,11 @@ function buildWhere(filters = {}, params = []) {
     params.push(filters.source, filters.source);
   }
 
+  if (filters.memory_tier) {
+    clauses.push("(memory_tier = ? OR json_extract(metadata, '$.memory_tier') = ?)");
+    params.push(filters.memory_tier, filters.memory_tier);
+  }
+
   if (filters.topic) {
     clauses.push('metadata LIKE ?');
     params.push(`%"${filters.topic}"%`);
@@ -394,6 +481,8 @@ function scoreThought(thought, queryTokens, query, options = {}) {
   if (options.topic && (meta.topics || []).some((t) => t.toLowerCase() === options.topic.toLowerCase())) score += 2;
   if (options.person && (meta.people || []).some((p) => p.toLowerCase() === options.person.toLowerCase())) score += 2;
   if (thought.confidence) score += Number(thought.confidence) * 0.75;
+  if (thought.importance) score += Number(thought.importance) * 1.25;
+  if (thought.memory_tier === 'procedural') score += 0.5;
 
   const created = Date.parse(`${thought.created_at}Z`);
   if (Number.isFinite(created)) {
@@ -401,10 +490,22 @@ function scoreThought(thought, queryTokens, query, options = {}) {
     score += Math.max(0, 1.5 - ageDays / 180);
   }
 
+  if (thought.access_count) {
+    score += Math.min(2, thought.access_count * 0.1);
+  }
+
+  if (thought.last_accessed) {
+    const accessed = Date.parse(`${thought.last_accessed}Z`);
+    if (Number.isFinite(accessed)) {
+      const daysSinceAccess = Math.max(0, (Date.now() - accessed) / 86400000);
+      score -= Math.min(1, daysSinceAccess / 365);
+    }
+  }
+
   return score;
 }
 
-function searchThoughts(query, optionsOrLimit = {}) {
+function searchThoughts(query, optionsOrLimit = {}, queryEmbedding = null) {
   const options = typeof optionsOrLimit === 'number'
     ? { limit: optionsOrLimit }
     : { ...(optionsOrLimit || {}) };
@@ -417,6 +518,7 @@ function searchThoughts(query, optionsOrLimit = {}) {
     projectScope,
     type: cleanString(options.type),
     source: cleanString(options.source),
+    memory_tier: cleanString(options.memory_tier),
     topic: cleanString(options.topic),
     person: cleanString(options.person),
   };
@@ -429,15 +531,16 @@ function searchThoughts(query, optionsOrLimit = {}) {
   const ftsQuery = buildFtsQuery(query);
   if (ftsQuery) {
     try {
+      const ftsParams = queryEmbedding ? [JSON.stringify(queryEmbedding), ftsQuery, ...params, Math.max(limit * 5, 50)] : [ftsQuery, ...params, Math.max(limit * 5, 50)];
       const ftsRows = db.prepare(`
-        SELECT t.*, rank AS fts_rank
+        SELECT t.*, rank AS fts_rank${queryEmbedding ? `, vec_distance(t.embedding, ?) AS vec_score` : ''}
         FROM thoughts_fts fts
         JOIN thoughts t ON t.rowid = fts.rowid
         WHERE thoughts_fts MATCH ?
           AND ${where}
         ORDER BY rank
         LIMIT ?
-      `).all(ftsQuery, ...params, Math.max(limit * 5, 50));
+      `).all(...ftsParams);
       for (const row of ftsRows) {
         ids.add(row.id);
         rows.push(row);
@@ -447,40 +550,60 @@ function searchThoughts(query, optionsOrLimit = {}) {
     }
   }
 
+  const queryParams = queryEmbedding ? [JSON.stringify(queryEmbedding), ...params, MAX_SCAN_ROWS] : [...params, MAX_SCAN_ROWS];
   const scanRows = db.prepare(`
-    SELECT *
+    SELECT *${queryEmbedding ? `, vec_distance(embedding, ?) AS vec_score` : ''}
     FROM thoughts
     WHERE ${where}
     ORDER BY created_at DESC
     LIMIT ?
-  `).all(...params, MAX_SCAN_ROWS);
+  `).all(...queryParams);
 
   for (const row of scanRows) {
     if (!ids.has(row.id)) rows.push(row);
   }
 
   const includeStale = options.exclude_stale ? false : true;
-  return rows
+  const finalThoughts = rows
     .map(rowToThought)
     .filter(Boolean)
     .filter((thought) => includeStale || !thought.stale_warning)
     .map((thought) => {
       const lexicalScore = queryTokens.length ? scoreThought(thought, queryTokens, query, filters) : 1;
       const ftsBoost = thought.fts_rank !== undefined ? 3 : 0;
-      return { ...thought, relevance: lexicalScore + ftsBoost };
+      const vecSimilarity = thought.vec_score !== undefined ? (1 - thought.vec_score) : 0;
+      const vecBoost = vecSimilarity > 0.3 ? vecSimilarity * 15 : 0;
+      return { ...thought, relevance: lexicalScore + ftsBoost + vecBoost, similarity: vecSimilarity };
     })
     .filter((thought) => !queryTokens.length || thought.relevance > 0)
     .sort((a, b) => b.relevance - a.relevance)
     .slice(0, limit);
+
+  if (finalThoughts.length) {
+    try {
+      const idsToUpdate = finalThoughts.map((t) => t.id);
+      const placeholders = idsToUpdate.map(() => '?').join(',');
+      db.prepare(`
+        UPDATE thoughts
+        SET access_count = coalesce(access_count, 0) + 1, last_accessed = datetime('now')
+        WHERE id IN (${placeholders})
+      `).run(...idsToUpdate);
+    } catch {
+      // Ignore errors updating access count
+    }
+  }
+
+  return finalThoughts;
 }
 
-function getRecentThoughts({ type, topic, person, project, source, days, limit = 20, exclude_stale = false } = {}) {
+function getRecentThoughts({ type, topic, person, project, source, memory_tier, days, limit = 20, exclude_stale = false } = {}) {
   const params = [];
   const filters = {
     type: cleanString(type),
     topic: cleanString(topic),
     person: cleanString(person),
     source: cleanString(source),
+    memory_tier: cleanString(memory_tier),
     project: cleanString(project),
     projectScope: project ? 'only' : 'all',
   };
@@ -501,9 +624,15 @@ function getRecentThoughts({ type, topic, person, project, source, days, limit =
 
 function getThoughtStats() {
   const total = db.prepare('SELECT COUNT(*) as total FROM thoughts').get().total;
-  const allThoughts = db.prepare('SELECT * FROM thoughts ORDER BY created_at DESC').all().map(rowToThought);
+  const allThoughts = db.prepare(`
+    SELECT id, content, metadata, type, source, project, confidence, verified_at,
+           stale_after, memory_tier, importance, expires_at, access_count,
+           last_accessed, created_at, updated_at
+    FROM thoughts
+    ORDER BY created_at DESC
+  `).all().map(rowToThought);
 
-  const types = {}, topics = {}, people = {}, projects = {}, sources = {};
+  const types = {}, topics = {}, people = {}, projects = {}, sources = {}, tiers = {};
   let oldest = null, newest = null, stale_count = 0;
 
   for (const thought of allThoughts) {
@@ -513,15 +642,16 @@ function getThoughtStats() {
     if (thought.type) types[thought.type] = (types[thought.type] || 0) + 1;
     if (thought.project) projects[thought.project] = (projects[thought.project] || 0) + 1;
     if (thought.source) sources[thought.source] = (sources[thought.source] || 0) + 1;
+    if (thought.memory_tier) tiers[thought.memory_tier] = (tiers[thought.memory_tier] || 0) + 1;
     if (thought.stale_warning) stale_count += 1;
     if (Array.isArray(m.topics)) for (const t of m.topics) topics[t] = (topics[t] || 0) + 1;
     if (Array.isArray(m.people)) for (const p of m.people) people[p] = (people[p] || 0) + 1;
   }
 
-  return { total, oldest, newest, types, topics, people, projects, sources, stale_count };
+  return { total, oldest, newest, types, topics, people, projects, sources, tiers, stale_count };
 }
 
-function captureThought(content, metadata = {}) {
+function captureThought(content, metadata = {}, embedding = null) {
   const normalized = normalizeMetadata(content, metadata);
   const existing = db.prepare('SELECT * FROM thoughts WHERE content = ?').get(content);
 
@@ -531,7 +661,8 @@ function captureThought(content, metadata = {}) {
     db.prepare(`
       UPDATE thoughts
       SET metadata = ?, type = ?, source = ?, project = ?, confidence = ?,
-          verified_at = ?, stale_after = ?, updated_at = datetime('now')
+          verified_at = ?, stale_after = ?, memory_tier = ?, importance = ?,
+          expires_at = ?, embedding = COALESCE(?, embedding), updated_at = datetime('now')
       WHERE id = ?
     `).run(
       JSON.stringify(merged),
@@ -541,6 +672,10 @@ function captureThought(content, metadata = {}) {
       merged.confidence,
       merged.verified_at,
       merged.stale_after,
+      merged.memory_tier,
+      merged.importance,
+      merged.expires_at,
+      embedding ? JSON.stringify(embedding) : null,
       existing.id
     );
     return { id: existing.id, action: 'updated', metadata: merged };
@@ -552,8 +687,9 @@ function captureThought(content, metadata = {}) {
 
   db.prepare(`
     INSERT INTO thoughts
-      (id, content, metadata, type, source, project, confidence, verified_at, stale_after, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+      (id, content, metadata, type, source, project, confidence, verified_at,
+       stale_after, memory_tier, importance, expires_at, embedding, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
   `).run(
     id,
     content,
@@ -563,7 +699,11 @@ function captureThought(content, metadata = {}) {
     normalized.project,
     normalized.confidence,
     normalized.verified_at,
-    normalized.stale_after
+    normalized.stale_after,
+    normalized.memory_tier,
+    normalized.importance,
+    normalized.expires_at,
+    embedding ? JSON.stringify(embedding) : null
   );
   return { id, action: 'created', metadata: normalized };
 }
@@ -639,7 +779,8 @@ function mergeThoughts(primaryId, duplicateIds, { merged_content, delete_duplica
   db.prepare(`
     UPDATE thoughts
     SET content = ?, metadata = ?, type = ?, source = ?, project = ?, confidence = ?,
-        verified_at = ?, stale_after = ?, updated_at = datetime('now')
+        verified_at = ?, stale_after = ?, memory_tier = ?, importance = ?,
+        expires_at = ?, updated_at = datetime('now')
     WHERE id = ?
   `).run(
     contentParts.join('\n\n'),
@@ -650,6 +791,9 @@ function mergeThoughts(primaryId, duplicateIds, { merged_content, delete_duplica
     metadata.confidence,
     metadata.verified_at,
     metadata.stale_after,
+    metadata.memory_tier,
+    metadata.importance,
+    metadata.expires_at,
     primaryId
   );
 
@@ -661,13 +805,13 @@ function mergeThoughts(primaryId, duplicateIds, { merged_content, delete_duplica
   return { primary_id: primaryId, merged_count: duplicates.length, deleted_duplicates: Boolean(delete_duplicates) };
 }
 
-function summarizeTopic({ topic, project, days, limit = 12 } = {}) {
+function summarizeTopic({ topic, project, days, limit = 12, queryEmbedding = null } = {}) {
   const thoughts = searchThoughts(topic || '', {
     limit,
     project,
     project_scope: project ? 'boost' : 'all',
     exclude_stale: false,
-  }).filter((thought) => {
+  }, queryEmbedding).filter((thought) => {
     if (!days) return true;
     const created = Date.parse(`${thought.created_at}Z`);
     return Number.isFinite(created) && Date.now() - created <= days * 86400000;
@@ -701,6 +845,8 @@ function summarizeTopic({ topic, project, days, limit = 12 } = {}) {
       source: thought.source,
       project: thought.project,
       confidence: thought.confidence,
+      memory_tier: thought.memory_tier,
+      importance: thought.importance,
     })),
   };
 }
@@ -758,12 +904,141 @@ function importThoughts(payload, { default_project, dry_run = false } = {}) {
       confidence: item.confidence ?? item.metadata?.confidence,
       verified_at: item.verified_at || item.metadata?.verified_at,
       stale_after: item.stale_after || item.metadata?.stale_after,
+      memory_tier: item.memory_tier || item.metadata?.memory_tier,
+      importance: item.importance ?? item.metadata?.importance,
+      expires_at: item.expires_at || item.metadata?.expires_at,
     });
     const result = captureThought(content, metadata);
     summary[result.action === 'created' ? 'created' : 'updated'] += 1;
   }
 
   return summary;
+}
+
+function getRelatedThoughts(id, { limit = 10 } = {}) {
+  const thought = fetchThought(id);
+  if (!thought) return [];
+
+  const metadata = thought.metadata || {};
+  const needles = uniqueStrings([
+    ...(metadata.topics || []),
+    ...(metadata.entities || []),
+    ...(metadata.people || []),
+    thought.project,
+  ]).map((value) => value.toLowerCase());
+
+  if (!needles.length) return [];
+
+  const rows = db.prepare(`
+    SELECT id, content, metadata, type, source, project, confidence, verified_at,
+           stale_after, memory_tier, importance, expires_at, access_count,
+           last_accessed, created_at, updated_at
+    FROM thoughts
+    WHERE id <> ?
+    ORDER BY created_at DESC
+    LIMIT ?
+  `).all(id, MAX_SCAN_ROWS).map(rowToThought);
+
+  return rows
+    .map((candidate) => {
+      const candidateMetadata = candidate.metadata || {};
+      const haystack = uniqueStrings([
+        ...(candidateMetadata.topics || []),
+        ...(candidateMetadata.entities || []),
+        ...(candidateMetadata.people || []),
+        candidate.project,
+      ]).map((value) => value.toLowerCase());
+      const shared = needles.filter((value) => haystack.includes(value));
+      const score = shared.length + (candidate.project && candidate.project === thought.project ? 1 : 0);
+      return { ...candidate, relation_score: score, shared_signals: shared };
+    })
+    .filter((candidate) => candidate.relation_score > 0)
+    .sort((a, b) => b.relation_score - a.relation_score || Number(b.importance || 0) - Number(a.importance || 0))
+    .slice(0, clamp(limit, 1, 50) || 10);
+}
+
+function getProjectProfile({ project, limit = 12 } = {}) {
+  const thoughts = getRecentThoughts({ project, limit: MAX_SCAN_ROWS });
+  const topics = {}, entities = {}, people = {}, tiers = {}, types = {};
+  const recent = [];
+  const important = [];
+  let stale_count = 0;
+
+  for (const thought of thoughts) {
+    const metadata = thought.metadata || {};
+    if (thought.stale_warning) stale_count += 1;
+    if (thought.memory_tier) tiers[thought.memory_tier] = (tiers[thought.memory_tier] || 0) + 1;
+    if (thought.type) types[thought.type] = (types[thought.type] || 0) + 1;
+    for (const topic of metadata.topics || []) topics[topic] = (topics[topic] || 0) + 1;
+    for (const entity of metadata.entities || []) entities[entity] = (entities[entity] || 0) + 1;
+    for (const person of metadata.people || []) people[person] = (people[person] || 0) + 1;
+    if (recent.length < limit) recent.push(thought);
+    important.push(thought);
+  }
+
+  const topEntries = (obj) => Object.entries(obj).sort((a, b) => b[1] - a[1]).slice(0, 10);
+  important.sort((a, b) => Number(b.importance || 0) - Number(a.importance || 0));
+
+  return {
+    project: project || null,
+    total: thoughts.length,
+    stale_count,
+    tiers: topEntries(tiers),
+    types: topEntries(types),
+    topics: topEntries(topics),
+    entities: topEntries(entities),
+    people: topEntries(people),
+    important: important.slice(0, limit).map((thought) => ({
+      id: thought.id,
+      content: thought.content,
+      type: thought.type,
+      memory_tier: thought.memory_tier,
+      importance: thought.importance,
+      created_at: thought.created_at,
+    })),
+    recent: recent.map((thought) => ({
+      id: thought.id,
+      content: thought.content,
+      type: thought.type,
+      memory_tier: thought.memory_tier,
+      created_at: thought.created_at,
+    })),
+  };
+}
+
+async function backfillEmbeddings(generateEmbedding, { limit = 100, project } = {}) {
+  if (typeof generateEmbedding !== 'function') throw new Error('generateEmbedding function is required.');
+
+  const params = [];
+  let where = "(embedding IS NULL OR embedding = '')";
+  if (project) {
+    where += ' AND project = ?';
+    params.push(project);
+  }
+  params.push(clamp(limit, 1, 1000) || 100);
+
+  const rows = db.prepare(`
+    SELECT id, content
+    FROM thoughts
+    WHERE ${where}
+    ORDER BY created_at DESC
+    LIMIT ?
+  `).all(...params);
+
+  let updated = 0;
+  let skipped = 0;
+  for (const row of rows) {
+    const embedding = await generateEmbedding(row.content);
+    if (!embedding) {
+      skipped += 1;
+      continue;
+    }
+    db.prepare("UPDATE thoughts SET embedding = ?, updated_at = datetime('now') WHERE id = ?")
+      .run(JSON.stringify(embedding), row.id);
+    updated += 1;
+  }
+
+  return { scanned: rows.length, updated, skipped };
 }
 
 function closeDatabase() {
@@ -783,6 +1058,9 @@ module.exports = {
   findDuplicateThoughts,
   mergeThoughts,
   summarizeTopic,
+  getRelatedThoughts,
+  getProjectProfile,
+  backfillEmbeddings,
   exportThoughts,
   importThoughts,
   getStaleWarning,

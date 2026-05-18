@@ -79,6 +79,86 @@ test('summarizes a topic with actions and key thoughts', () => {
   assert.ok(summary.key_thoughts.some((thought) => /export/i.test(thought.content)));
 });
 
+test('stores lifecycle tier and importance metadata', () => {
+  const result = brain.captureThought('Use the local-first router deployment workflow before touching live router files.', {
+    type: 'procedure',
+    topics: ['router', 'deploy'],
+    entities: ['ssh-mcp', 'OpenWrt'],
+    project: 'LiteFi',
+    confidence: 0.9,
+  });
+
+  const thought = brain.fetchThought(result.id);
+  assert.equal(thought.memory_tier, 'procedural');
+  assert.ok(thought.importance > 0.5);
+  assert.ok(thought.metadata.entities.includes('ssh-mcp'));
+});
+
+test('uses vector similarity when embeddings are available', () => {
+  brain.captureThought('OAuth token refresh bug was fixed in auth middleware.', {
+    type: 'incident',
+    project: 'VectorDemo',
+    topics: ['auth'],
+  }, [1, 0, 0]);
+  brain.captureThought('Karaoke lyric timing was tuned for medley playback.', {
+    type: 'incident',
+    project: 'VectorDemo',
+    topics: ['karaoke'],
+  }, [0, 1, 0]);
+
+  const results = brain.searchThoughts('zzzzsemantic', {
+    project: 'VectorDemo',
+    project_scope: 'only',
+    limit: 2,
+  }, [1, 0, 0]);
+
+  assert.equal(results[0].project, 'VectorDemo');
+  assert.match(results[0].content, /OAuth token/);
+  assert.ok(results[0].similarity > 0.9);
+});
+
+test('builds project profiles and related thought links', () => {
+  const first = brain.captureThought('SuperBrain embeds local memories for better semantic recall.', {
+    type: 'decision',
+    project: 'ProfileDemo',
+    topics: ['memory', 'embeddings'],
+    entities: ['SuperBrain'],
+  });
+  brain.captureThought('SuperBrain project profile should surface memory tiers and entities.', {
+    type: 'reference',
+    project: 'ProfileDemo',
+    topics: ['memory', 'profile'],
+    entities: ['SuperBrain'],
+  });
+
+  const related = brain.getRelatedThoughts(first.id, { limit: 5 });
+  assert.ok(related.some((thought) => thought.content.includes('project profile')));
+
+  const profile = brain.getProjectProfile({ project: 'ProfileDemo', limit: 5 });
+  assert.equal(profile.total, 2);
+  assert.ok(profile.entities.some(([entity]) => entity === 'SuperBrain'));
+});
+
+test('backfills missing embeddings with caller-provided generator', async () => {
+  brain.captureThought('Backfill test memory gets an embedding later.', {
+    type: 'reference',
+    project: 'BackfillDemo',
+  });
+
+  const result = await brain.backfillEmbeddings(async () => [0.5, 0.5], {
+    project: 'BackfillDemo',
+    limit: 10,
+  });
+
+  assert.equal(result.updated, 1);
+  const results = brain.searchThoughts('nolexical', {
+    project: 'BackfillDemo',
+    project_scope: 'only',
+    limit: 1,
+  }, [0.5, 0.5]);
+  assert.equal(results.length, 1);
+});
+
 test('finds and merges near-duplicate thoughts', () => {
   const a = brain.captureThought('Router deploy uses ssh-mcp and chown root root after upload.', {
     project: 'LiteFi',

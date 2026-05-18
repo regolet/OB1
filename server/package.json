@@ -1,17 +1,22 @@
 {
   "name": "@regolet/superbrain",
-  "version": "1.1.1",
+  "version": "2.0.0",
   "description": "SuperBrain — A fully local, SQLite-powered MCP server for persistent AI memory. Fork of Open Brain (OB1) — no cloud, no SaaS, just your brain on your machine.",
   "main": "src/index.js",
   "bin": {
-    "superbrain": "src/index.js"
+    "superbrain": "src/index.js",
+    "superbrain-backfill": "backfill.js",
+    "superbrain-install-hooks": "hooks/install-hooks.js"
   },
   "files": [
     "README.md",
+    "backfill.js",
+    "hooks",
     "src"
   ],
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "backfill": "node backfill.js"
   },
   "keywords": [
     "mcp",
@@ -32,6 +37,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
+    "@xenova/transformers": "^2.17.2",
     "better-sqlite3": "^11.7.0",
     "zod": "^3.24.0"
   }

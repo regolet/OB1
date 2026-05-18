@@ -1,5 +1,6 @@
 const { z } = require('zod');
 const db = require('./database');
+const { generateEmbedding } = require('./embeddings');
 
 function formatDate(value) {
   if (!value) return '??';
@@ -15,8 +16,15 @@ function formatThought(thought, index) {
   const confidence = Number.isFinite(Number(thought.confidence))
     ? ` confidence=${Number(thought.confidence).toFixed(2)}`
     : '';
+  const tier = thought.memory_tier ? ` tier=${thought.memory_tier}` : '';
+  const importance = Number.isFinite(Number(thought.importance))
+    ? ` importance=${Number(thought.importance).toFixed(2)}`
+    : '';
+  const similarity = Number.isFinite(Number(thought.similarity)) && thought.similarity > 0
+    ? ` similarity=${Number(thought.similarity).toFixed(2)}`
+    : '';
   const stale = thought.stale_warning ? `\n   WARNING: ${thought.stale_warning.message}` : '';
-  return `${index + 1}. [${formatDate(thought.created_at)}] (${thought.type || m.type || 'thought'}${tags})${project}${source}${confidence}\n   ${thought.content}${stale}`;
+  return `${index + 1}. [${formatDate(thought.created_at)}] (${thought.type || m.type || 'thought'}${tags})${project}${source}${tier}${importance}${confidence}${similarity}\n   ${thought.content}${stale}`;
 }
 
 function formatSummary(summary) {
@@ -56,6 +64,35 @@ function formatSummary(summary) {
   return lines.join('\n');
 }
 
+function formatProjectProfile(profile) {
+  const lines = [
+    profile.project ? `Project: ${profile.project}` : 'Project: all memories',
+    `Total memories: ${profile.total}`,
+    `Stale memories: ${profile.stale_count}`,
+  ];
+
+  const addEntries = (title, entries) => {
+    if (!entries.length) return;
+    lines.push('', `${title}:`);
+    for (const [name, count] of entries) lines.push(`  - ${name}: ${count}`);
+  };
+
+  addEntries('Memory tiers', profile.tiers);
+  addEntries('Types', profile.types);
+  addEntries('Top topics', profile.topics);
+  addEntries('Entities', profile.entities);
+  addEntries('People', profile.people);
+
+  if (profile.important.length) {
+    lines.push('', 'Important memories:');
+    for (const thought of profile.important) {
+      lines.push(`  - ${thought.content} (${thought.memory_tier || thought.type || 'memory'}, importance ${Number(thought.importance || 0).toFixed(2)})`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
 function registerTools(server) {
   server.tool(
     'search',
@@ -67,22 +104,25 @@ function registerTools(server) {
       project_scope: z.enum(['boost', 'only', 'all']).optional().default('boost').describe('boost = prioritize project matches, only = filter to project, all = ignore project'),
       type: z.string().optional().describe('Filter by type: observation, task, idea, reference, person_note, current_state, incident'),
       source: z.string().optional().describe('Filter by provenance/source: user, tool, inferred, manual, imported, mcp'),
+      memory_tier: z.string().optional().describe('Filter by lifecycle tier: working, episodic, semantic, procedural'),
       topic: z.string().optional().describe('Filter by topic tag'),
       person: z.string().optional().describe('Filter by person mentioned'),
       exclude_stale: z.boolean().optional().default(false).describe('Exclude memories whose stale_after date has passed'),
     },
-    async ({ query, limit, project, project_scope, type, source, topic, person, exclude_stale }) => {
+    async ({ query, limit, project, project_scope, type, source, memory_tier, topic, person, exclude_stale }) => {
       try {
+        const queryEmbedding = await generateEmbedding(query);
         const results = db.searchThoughts(query, {
           limit: limit || 10,
           project,
           project_scope,
           type,
           source,
+          memory_tier,
           topic,
           person,
           exclude_stale,
-        });
+        }, queryEmbedding);
         if (!results.length) return { content: [{ type: 'text', text: 'No matching thoughts found.' }] };
 
         return {
@@ -106,11 +146,12 @@ function registerTools(server) {
       person: z.string().optional().describe('Filter by person mentioned'),
       project: z.string().optional().describe('Filter by project/workspace'),
       source: z.string().optional().describe('Filter by provenance/source'),
+      memory_tier: z.string().optional().describe('Filter by lifecycle tier'),
       days: z.number().optional().describe('Only show thoughts from the last N days'),
       exclude_stale: z.boolean().optional().default(false).describe('Hide stale memories'),
       limit: z.number().optional().default(20).describe('Max results (default: 20)'),
     },
-    async ({ type, topic, person, project, source, days, exclude_stale, limit }) => {
+    async ({ type, topic, person, project, source, memory_tier, days, exclude_stale, limit }) => {
       try {
         const results = db.getRecentThoughts({
           type,
@@ -118,6 +159,7 @@ function registerTools(server) {
           person,
           project,
           source,
+          memory_tier,
           days,
           exclude_stale,
           limit: limit || 20,
@@ -164,6 +206,11 @@ function registerTools(server) {
           for (const [k, v] of sortEntries(stats.sources)) lines.push(`  ${k}: ${v}`);
         }
 
+        if (Object.keys(stats.tiers).length) {
+          lines.push('', 'Memory tiers:');
+          for (const [k, v] of sortEntries(stats.tiers)) lines.push(`  ${k}: ${v}`);
+        }
+
         if (Object.keys(stats.topics).length) {
           lines.push('', 'Top topics:');
           for (const [k, v] of sortEntries(stats.topics)) lines.push(`  ${k}: ${v}`);
@@ -197,8 +244,11 @@ function registerTools(server) {
       verified_at: z.string().optional().describe('When this memory was verified, ISO date/time preferred'),
       stale_after: z.string().optional().describe('Exact ISO date/time after which this memory should warn as stale'),
       stale_days: z.number().optional().describe('Relative number of days until this memory should warn as stale'),
+      memory_tier: z.string().optional().describe('Lifecycle tier: working, episodic, semantic, or procedural'),
+      importance: z.number().min(0).max(1).optional().describe('Importance from 0 to 1'),
+      expires_at: z.string().optional().describe('Optional ISO date/time when this memory should be considered expired'),
     },
-    async ({ content, type, topics, people, action_items, entities, source, project, confidence, verified_at, stale_after, stale_days }) => {
+    async ({ content, type, topics, people, action_items, entities, source, project, confidence, verified_at, stale_after, stale_days, memory_tier, importance, expires_at }) => {
       try {
         const metadata = {
           type: type || 'observation',
@@ -212,13 +262,20 @@ function registerTools(server) {
           verified_at,
           stale_after,
           stale_days,
+          memory_tier,
+          importance,
+          expires_at,
         };
 
-        const result = db.captureThought(content, metadata);
+        const embedding = await generateEmbedding(content);
+
+        const result = db.captureThought(content, metadata, embedding);
         const saved = result.metadata || metadata;
 
         let confirmation = `${result.action === 'updated' ? 'Updated' : 'Captured'} as ${saved.type}`;
         if (saved.project) confirmation += ` | Project: ${saved.project}`;
+        if (saved.memory_tier) confirmation += ` | Tier: ${saved.memory_tier}`;
+        if (Number.isFinite(Number(saved.importance))) confirmation += ` | Importance: ${Number(saved.importance).toFixed(2)}`;
         if (saved.source) confirmation += ` | Source: ${saved.source}`;
         if (Number.isFinite(Number(saved.confidence))) confirmation += ` | Confidence: ${Number(saved.confidence).toFixed(2)}`;
         if (saved.stale_after) confirmation += ` | Stale after: ${saved.stale_after}`;
@@ -244,7 +301,8 @@ function registerTools(server) {
     },
     async ({ topic, project, days, limit }) => {
       try {
-        const summary = db.summarizeTopic({ topic, project, days, limit: limit || 12 });
+        const queryEmbedding = await generateEmbedding(topic);
+        const summary = db.summarizeTopic({ topic, project, days, limit: limit || 12, queryEmbedding });
         return { content: [{ type: 'text', text: formatSummary(summary) }] };
       } catch (err) {
         return { content: [{ type: 'text', text: `Summary error: ${err.message}` }], isError: true };
@@ -275,6 +333,66 @@ function registerTools(server) {
         return { content: [{ type: 'text', text: lines.join('\n') }] };
       } catch (err) {
         return { content: [{ type: 'text', text: `Duplicate scan error: ${err.message}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'related_thoughts',
+    'Find memories related to a specific thought by shared project, topics, entities, and people.',
+    {
+      id: z.string().describe('Thought ID to expand from'),
+      limit: z.number().optional().default(10).describe('Max related memories to return'),
+    },
+    async ({ id, limit }) => {
+      try {
+        const results = db.getRelatedThoughts(id, { limit: limit || 10 });
+        if (!results.length) return { content: [{ type: 'text', text: 'No related thoughts found.' }] };
+        return {
+          content: [{
+            type: 'text',
+            text: `${results.length} related thought(s):\n\n${results.map((thought, i) => {
+              const shared = thought.shared_signals?.length ? ` shared=${thought.shared_signals.join(', ')}` : '';
+              return `${formatThought(thought, i)}${shared}`;
+            }).join('\n\n')}`,
+          }],
+        };
+      } catch (err) {
+        return { content: [{ type: 'text', text: `Related search error: ${err.message}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'project_profile',
+    'Summarize a project memory profile: tiers, types, topics, entities, people, important memories, and stale count.',
+    {
+      project: z.string().optional().describe('Project/workspace to summarize. Omit for all memories.'),
+      limit: z.number().optional().default(12).describe('Max important memories to include'),
+    },
+    async ({ project, limit }) => {
+      try {
+        const profile = db.getProjectProfile({ project, limit: limit || 12 });
+        return { content: [{ type: 'text', text: formatProjectProfile(profile) }] };
+      } catch (err) {
+        return { content: [{ type: 'text', text: `Project profile error: ${err.message}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'backfill_embeddings',
+    'Generate missing local embeddings for existing memories. Use after upgrading from older SuperBrain versions.',
+    {
+      project: z.string().optional().describe('Only backfill one project/workspace'),
+      limit: z.number().optional().default(100).describe('Max memories to backfill in this run'),
+    },
+    async ({ project, limit }) => {
+      try {
+        const result = await db.backfillEmbeddings(generateEmbedding, { project, limit: limit || 100 });
+        return { content: [{ type: 'text', text: `Embedding backfill: ${JSON.stringify(result)}` }] };
+      } catch (err) {
+        return { content: [{ type: 'text', text: `Embedding backfill error: ${err.message}` }], isError: true };
       }
     }
   );
